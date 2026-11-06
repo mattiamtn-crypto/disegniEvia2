@@ -1,0 +1,11 @@
+cat
+dog
+airplane
+alarm clock
+banana
+bicycle
+boomerang
+carrot
+cloud
+dolphin
+donut

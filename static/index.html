@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Disegna e vIA!</title>
+<style>
+:root{--bg:#EAF0F4;--ink:#17202A;--board:#1C2733;--chalk:#F5F7F2;--accent:#2F5BEA;--ok:#1F9D6B;--ko:#D6453D;--muted:#5B6B7A}
+*{box-sizing:border-box}
+html,body{margin:0}
+body{background:var(--bg);color:var(--ink);font:16px/1.45 "Segoe UI",system-ui,-apple-system,sans-serif}
+main{max-width:480px;margin:0 auto;padding:20px 16px 32px;display:grid;gap:16px}
+h1{margin:0;font-size:1.6rem;letter-spacing:-.02em}
+#prompt{margin:4px 0 0;color:var(--muted);min-height:1.5em}
+#prompt strong{color:var(--ink);font-size:1.3rem}
+.stage{position:relative}
+#board{display:block;width:100%;aspect-ratio:1;background:var(--board);border-radius:14px;touch-action:none;cursor:crosshair}
+#clock{position:absolute;top:10px;right:14px;color:var(--chalk);font-weight:700;font-size:1.4rem;font-variant-numeric:tabular-nums;opacity:.9;pointer-events:none}
+.hint{margin:0;color:var(--muted)}
+.guess{display:grid;grid-template-columns:1fr auto;gap:2px 10px;align-items:center;margin-bottom:10px}
+.guess .name{font-weight:600}
+.guess .pct{color:var(--muted);font-variant-numeric:tabular-nums}
+.bar{grid-column:1/-1;height:8px;background:#D3DDE5;border-radius:4px;overflow:hidden}
+.bar i{display:block;height:100%;background:var(--accent);transition:width .2s}
+.guess.is-target .bar i{background:var(--ok)}
+.actions{display:flex;gap:10px}
+button{flex:1;padding:12px 14px;border:0;border-radius:10px;font:inherit;font-weight:600;background:var(--accent);color:#fff;cursor:pointer}
+button.ghost{background:transparent;color:var(--ink);box-shadow:inset 0 0 0 2px #B9C6D1}
+button:focus-visible{outline:3px solid var(--ink);outline-offset:2px}
+#status{margin:0;font-weight:600;min-height:1.5em}
+#status.ok{color:var(--ok)}
+#status.ko{color:var(--ko)}
+#count{margin:0;font-size:.85rem;color:var(--muted)}
+@media (prefers-reduced-motion:reduce){.bar i{transition:none}}
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Disegna e vIA!</h1>
+    <p id="prompt">Disegna quello che vuoi: l’IA prova a indovinare.</p>
+  </header>
+
+  <section class="stage">
+    <canvas id="board" width="420" height="420" aria-label="Lavagna per disegnare"></canvas>
+    <span id="clock"></span>
+  </section>
+
+  <section id="guesses" aria-live="polite"></section>
+
+  <div class="actions">
+    <button id="clear" class="ghost" type="button">Cancella</button>
+    <button id="start" type="button">Nuovo round</button>
+  </div>
+
+  <p id="status" role="status"></p>
+  <p id="count"></p>
+</main>
+
+<script>
+const ROUND_SECONDS = 20;     // durata di un round
+const WIN_PROB = 0.5;         // probabilità minima per dire "riconosciuto"
+const PREDICT_EVERY_MS = 400; // ogni quanto interrogare il modello mentre disegni
+
+const $ = id => document.getElementById(id);
+const canvas = $('board');
+const ctx = canvas.getContext('2d');
+ctx.lineWidth = 16;
+ctx.lineCap = 'round';
+ctx.lineJoin = 'round';
+ctx.strokeStyle = '#F5F7F2';
+ctx.fillStyle = '#F5F7F2';
+
+let labels = [], target = null, roundOn = false, left = 0, tick = null;
+let drawing = false, last = null, hasInk = false;
+let busy = false, dirty = false, lastRun = 0, timeoutId = null;
+
+function say(text, kind) {
+  const s = $('status');
+  s.textContent = text;
+  s.className = kind || '';
+}
+
+function showHint() {
+  const p = document.createElement('p');
+  p.className = 'hint';
+  p.textContent = 'Disegna qualcosa e l’IA proverà a indovinare.';
+  $('guesses').replaceChildren(p);
+}
+
+function pos(e) {
+  const r = canvas.getBoundingClientRect();
+  return { x: (e.clientX - r.left) * canvas.width / r.width,
+           y: (e.clientY - r.top) * canvas.height / r.height };
+}
+
+canvas.addEventListener('pointerdown', e => {
+  canvas.setPointerCapture(e.pointerId);
+  drawing = true;
+  last = pos(e);
+  ctx.beginPath();
+  ctx.arc(last.x, last.y, ctx.lineWidth / 2, 0, Math.PI * 2);
+  ctx.fill();
+  hasInk = true;
+});
+
+canvas.addEventListener('pointermove', e => {
+  if (!drawing) return;
+  const p = pos(e);
+  ctx.beginPath();
+  ctx.moveTo(last.x, last.y);
+  ctx.lineTo(p.x, p.y);
+  ctx.stroke();
+  last = p;
+  schedule();
+});
+
+['pointerup', 'pointercancel'].forEach(t => canvas.addEventListener(t, () => {
+  if (!drawing) return;
+  drawing = false;
+  schedule(0);
+}));
+
+// Il modello è addestrato su tratti bianchi su sfondo nero: esporto così.
+function exportPng() {
+  const c = document.createElement('canvas');
+  c.width = canvas.width;
+  c.height = canvas.height;
+  const x = c.getContext('2d');
+  x.fillStyle = '#000';
+  x.fillRect(0, 0, c.width, c.height);
+  x.drawImage(canvas, 0, 0);
+  return c.toDataURL('image/png');
+}
+
+function schedule(delay) {
+  clearTimeout(timeoutId);
+  const wait = delay ?? Math.max(0, PREDICT_EVERY_MS - (Date.now() - lastRun));
+  timeoutId = setTimeout(predict, wait);
+}
+
+async function predict() {
+  if (!hasInk) return;
+  if (busy) { dirty = true; return; }
+  busy = true;
+  dirty = false;
+  lastRun = Date.now();
+  try {
+    const res = await fetch('/predict', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ image: exportPng() })
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || res.status);
+    showGuesses(data.top);
+    checkWin(data.top);
+  } catch (err) {
+    say('Il server non risponde: ' + err.message, 'ko');
+  }
+  busy = false;
+  if (dirty) schedule(0);
+}
+
+function showGuesses(top) {
+  if (!top.length) { showHint(); return; }
+  const box = $('guesses');
+  box.replaceChildren();
+  top.forEach(t => {
+    const row = document.createElement('div');
+    row.className = 'guess' + (roundOn && t.label === target ? ' is-target' : '');
+    const name = document.createElement('span');
+    name.className = 'name';
+    name.textContent = t.label;
+    const pct = document.createElement('span');
+    pct.className = 'pct';
+    pct.textContent = Math.round(t.prob * 100) + '%';
+    const bar = document.createElement('div');
+    bar.className = 'bar';
+    const fill = document.createElement('i');
+    fill.style.width = (t.prob * 100) + '%';
+    bar.append(fill);
+    row.append(name, pct, bar);
+    box.append(row);
+  });
+}
+
+function checkWin(top) {
+  if (roundOn && top.length && top[0].label === target && top[0].prob >= WIN_PROB) endRound(true);
+}
+
+function renderClock() {
+  $('clock').textContent = roundOn ? left + ' s' : '';
+}
+
+function clearBoard() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  hasInk = false;
+  clearTimeout(timeoutId);
+  showHint();
+}
+
+function startRound() {
+  if (!labels.length) { say('Categorie non caricate: il server è acceso?', 'ko'); return; }
+  clearBoard();
+  let next;
+  do { next = labels[Math.floor(Math.random() * labels.length)]; }
+  while (labels.length > 1 && next === target);
+  target = next;
+  roundOn = true;
+  left = ROUND_SECONDS;
+  const strong = document.createElement('strong');
+  strong.textContent = target;
+  $('prompt').replaceChildren(document.createTextNode('Disegna: '), strong);
+  say('');
+  renderClock();
+  clearInterval(tick);
+  tick = setInterval(() => {
+    left--;
+    renderClock();
+    if (left <= 0) endRound(false);
+  }, 1000);
+}
+
+function endRound(won) {
+  if (!roundOn) return;
+  roundOn = false;
+  clearInterval(tick);
+  const used = ROUND_SECONDS - left;
+  say(won ? `L’IA ha riconosciuto “${target}” in ${used} s.`
+          : `Tempo scaduto: dovevi disegnare “${target}”.`, won ? 'ok' : 'ko');
+  renderClock();
+}
+
+$('clear').addEventListener('click', clearBoard);
+$('start').addEventListener('click', startRound);
+
+showHint();
+fetch('/categories')
+  .then(r => r.json())
+  .then(l => { labels = l; $('count').textContent = 'Il modello conosce ' + l.length + ' categorie.'; })
+  .catch(() => say('Non riesco a contattare il server.', 'ko'));
+</script>
+</body>
+</html>
